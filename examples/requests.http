@@ -1,0 +1,338 @@
+### 应急无线电演练通联日志互证服务 —— 请求示例
+### 可直接用 IntelliJ HTTP Client / VS Code REST Client 执行。
+@host = http://127.0.0.1:8080
+@drill = DRILL-2026
+
+### 健康检查
+GET {{host}}/health
+
+### 创建演练（允许时差 10 秒，非负；非法负值返回 422）
+POST {{host}}/drills
+Content-Type: application/json
+
+{
+  "drill_id": "{{drill}}",
+  "allowed_time_diff_seconds": 10
+}
+
+### 查询演练状态
+GET {{host}}/drills/{{drill}}
+
+### 单条写入/更正日志（路径上的记录号优先；时间必须带时区）
+PUT {{host}}/drills/{{drill}}/logs/R1
+Content-Type: application/json
+
+{
+  "record_no": "R1",
+  "station": "BH1AAA",
+  "counterpart": "BH2BBB",
+  "time": "2026-10-04T08:00:00+08:00",
+  "band": "40m",
+  "mode": "SSB"
+}
+
+PUT {{host}}/drills/{{drill}}/logs/R2
+Content-Type: application/json
+
+{
+  "record_no": "R2",
+  "station": "BH2BBB",
+  "counterpart": "BH1AAA",
+  "time": "2026-10-04T00:00:05+00:00",
+  "band": "40m",
+  "mode": "SSB"
+}
+
+### 批量写入（整体事务；任一条非法或批次内记录号重复则整批拒绝）
+POST {{host}}/drills/{{drill}}/logs
+Content-Type: application/json
+
+{
+  "logs": [
+    {
+      "record_no": "R3",
+      "station": "BH3CCC",
+      "counterpart": "BH4DDD",
+      "time": "2026-10-04T00:00:00+00:00",
+      "band": "40m",
+      "mode": "SSB"
+    },
+    {
+      "record_no": "R4",
+      "station": "BH4DDD",
+      "counterpart": "BH3CCC",
+      "time": "2026-10-04T00:00:08+00:00",
+      "band": "40m",
+      "mode": "SSB"
+    }
+  ]
+}
+
+### 批量预演（只读；请求体与批量写入相同，不改日志/锁定/结果/版本/快照）
+### 返回 base_version、current_result、proposed_result、diff、normalized_batch、token
+POST {{host}}/drills/{{drill}}/logs/preview
+Content-Type: application/json
+
+{
+  "logs": [
+    {
+      "record_no": "R3",
+      "station": "BH3CCC",
+      "counterpart": "BH4DDD",
+      "time": "2026-10-04T00:00:00+00:00",
+      "band": "40m",
+      "mode": "SSB"
+    },
+    {
+      "record_no": "R4",
+      "station": "BH4DDD",
+      "counterpart": "BH3CCC",
+      "time": "2026-10-04T00:00:08+00:00",
+      "band": "40m",
+      "mode": "SSB"
+    }
+  ]
+}
+
+# 预演成功后，把响应中的 token 与 base_version 原样填入下一个请求。
+@previewToken = pv1.把预演响应中的token粘到这里
+@baseVersion = 0
+
+### 按预演确认提交（原子落库；响应与 POST /logs 一致）
+### 标识不符 409 preview_token_mismatch；
+### 版本已变化 409 preview_base_version_changed；
+### 演练已封存 409 drill_sealed（均不改变状态，需重新预演）
+POST {{host}}/drills/{{drill}}/logs/confirm
+Content-Type: application/json
+
+{
+  "logs": [
+    {
+      "record_no": "R3",
+      "station": "BH3CCC",
+      "counterpart": "BH4DDD",
+      "time": "2026-10-04T00:00:00+00:00",
+      "band": "40m",
+      "mode": "SSB"
+    },
+    {
+      "record_no": "R4",
+      "station": "BH4DDD",
+      "counterpart": "BH3CCC",
+      "time": "2026-10-04T00:00:08+00:00",
+      "band": "40m",
+      "mode": "SSB"
+    }
+  ],
+  "base_version": {{baseVersion}},
+  "token": "{{previewToken}}"
+}
+
+### 查看全部日志
+GET {{host}}/drills/{{drill}}/logs
+
+### 查询互证结果（配对 + 未配对 + 版本 + 总时差）
+GET {{host}}/drills/{{drill}}/result
+
+### 未配对日志缺口诊断（只读；按当前日志依次归因，带当前版本）
+### reason: candidate_occupied 候选已占用（有完全符合互指/波段/模式/时差
+###         的候选却未入选，该候选必已被别的配对/锁定占用）
+###         time_diff_exceeded 时差超限（互指且波段/模式相同，时差超允许值）
+###         band_or_mode_mismatch 波段或模式不符（仅互指）
+###         missing_counterpart_log 缺少对方日志（无任何互指记录）
+### 前三类返回该类中时差最小（再按记录号最小）的对方记录与实际时差；
+### 末类 counterpart_record_no / time_diff_seconds 均为 null。
+GET {{host}}/drills/{{drill}}/gap-diagnostics
+
+### 按台站汇总互证结果（只读；台站按呼号升序，带当前版本与封存状态）
+### 逐台站返回：日志总数 total_logs、已配对数 paired_logs（一对互证的
+### 两条记录分别计入两端台站）、未配对数 unpaired_logs（只计入其本台）、
+### 配对覆盖率 paired_coverage = paired_logs / total_logs（0..1，6 位小数）。
+### 仅在对方呼号中出现而未上报日志的台站不产生汇总项；空演练 stations 为空。
+GET {{host}}/drills/{{drill}}/station-summary
+
+### 锁定一对互证候选（记录号顺序任意，服务端内部升序）
+### 仅接受：现存、相互指认、波段/模式相同、时差不超允许值，
+### 且两条记录均未被其他锁定占用。锁定强制入选结果（即使拉低全场配对数）。
+PUT {{host}}/drills/{{drill}}/locks
+Content-Type: application/json
+
+{
+  "record_a": "R1",
+  "record_b": "R2"
+}
+
+### 重复锁定同一对（含颠倒顺序）视为重传：200，版本不推进
+PUT {{host}}/drills/{{drill}}/locks
+Content-Type: application/json
+
+{
+  "record_a": "R2",
+  "record_b": "R1"
+}
+
+### 查询锁定清单及最新互证结果
+GET {{host}}/drills/{{drill}}/locks
+
+### 解除已有锁定（不存在则 404 lock_not_found；顺序同样任意）
+POST {{host}}/drills/{{drill}}/locks/unlock
+Content-Type: application/json
+
+{
+  "record_a": "R1",
+  "record_b": "R2"
+}
+
+### 日志归错演练：跨演练迁移（源演练路径参数；目标演练与记录号在请求体）
+### 受理条件：两演练均存在且未封存、源≠目标、源记录全存在、
+###           目标无同号记录、被移记录不参与源演练锁定；
+###           否则整次拒绝、两端状态不变。
+### 成功：日志原字段保留，按目标允许时差重算；两端各只推进一次版本、
+###       各留存一版新快照，日志/版本/结果/快照同一事务原子提交。
+
+### 先建第二个演练作为迁移目标（允许时差 30 秒）
+POST {{host}}/drills
+Content-Type: application/json
+
+{
+  "drill_id": "DRILL-2026-B",
+  "allowed_time_diff_seconds": 30
+}
+
+### 把 R1、R2 从 DRILL-2026（允许 10 秒）迁到 DRILL-2026-B（允许 30 秒）
+### 例如两条记录时差 20 秒：源端配不上，迁入目标端后即可互证。
+POST {{host}}/drills/DRILL-2026/transfer
+Content-Type: application/json
+
+{
+  "target_drill_id": "DRILL-2026-B",
+  "record_nos": ["R1", "R2"]
+}
+
+### 拒绝示例：记录号列表为空（422）/ 列表内重复（409 duplicate_record_in_transfer）
+###   源记录不存在（404 transfer_record_missing）
+###   目标已有同号（409 target_record_exists）
+###   记录被源演练锁定占用（409 transfer_record_locked）
+###   源/目标相同（422 same_drill_transfer）
+###   任一端已封存（409 drill_sealed）
+### 以上任一拒绝均不改两端状态（日志、版本、结果、快照、锁定均不变）。
+POST {{host}}/drills/DRILL-2026/transfer
+Content-Type: application/json
+
+{
+  "target_drill_id": "DRILL-2026-B",
+  "record_nos": ["R1", "R1"]
+}
+
+### 争议日志隔离：批量隔离（只改变互证资格，不删除日志、不改写原字段）
+### 被隔离记录不参与配对、不进入未配对清单/缺口诊断（候选也仅限未隔离
+### 日志）、不计入台站汇总；隔离期间仍可更正日志（状态保留）。
+### 仅实际状态变化推进一次版本，结果与隔离清单同事务写入新版本快照。
+PUT {{host}}/drills/{{drill}}/quarantine
+Content-Type: application/json
+
+{
+  "record_nos": ["R3", "R4"]
+}
+
+### 重复隔离同一批：已隔离的记录自动跳过，整批无变化则不推进版本
+PUT {{host}}/drills/{{drill}}/quarantine
+Content-Type: application/json
+
+{
+  "record_nos": ["R3", "R4"]
+}
+
+### 查询隔离清单（按记录号升序）及最新互证结果（只读；封存后仍可查）
+GET {{host}}/drills/{{drill}}/quarantine
+
+### 批量恢复：按当前日志重新求解（含隔离期间的更正）；重复恢复不推进版本
+POST {{host}}/drills/{{drill}}/quarantine/restore
+Content-Type: application/json
+
+{
+  "record_nos": ["R3", "R4"]
+}
+
+### 拒绝示例（均整批拒绝、状态不变）：
+###   记录不存在（404 quarantine_record_missing）
+###   批次内编号重复（409 duplicate_record_in_quarantine）
+###   涉及人工锁定中的记录（409 quarantine_record_locked）
+###   演练已封存（409 drill_sealed）；记录号列表为空（422）
+### 关联约束：锁定被隔离记录（409 lock_record_quarantined）
+###   迁移被隔离记录（409 transfer_record_quarantined）
+PUT {{host}}/drills/{{drill}}/quarantine
+Content-Type: application/json
+
+{
+  "record_nos": ["R3", "R3"]
+}
+
+### 复核员批量裁决：锁定/解除与隔离/恢复意图一次提交，按最终状态整批判定
+### base_version 须等于演练当前版本（先 GET /result 查看），否则
+### 409 adjudication_base_version_changed；意图顺序不影响结果；
+### 重复同向意图只算一次；同一对象相反意图 409 adjudication_intent_conflict。
+### 下例：解除旧锁 (R1,R2) 并隔离 R2、恢复 R5、锁定 (R3,R4) —— 一个事务，
+### 有实际变化时整批只推进一次版本并留存快照；纯重传不推进。
+POST {{host}}/drills/{{drill}}/adjudications
+Content-Type: application/json
+
+{
+  "base_version": 0,
+  "locks": [
+    {"action": "unlock", "record_a": "R1", "record_b": "R2"},
+    {"action": "lock",   "record_a": "R3", "record_b": "R4"}
+  ],
+  "quarantine": [
+    {"action": "quarantine", "record_no": "R2"},
+    {"action": "restore",    "record_no": "R5"}
+  ]
+}
+
+### 同批恢复并锁定（最终状态无冲突，可受理）
+POST {{host}}/drills/{{drill}}/adjudications
+Content-Type: application/json
+
+{
+  "base_version": 0,
+  "locks": [
+    {"action": "lock", "record_a": "R1", "record_b": "R2"}
+  ],
+  "quarantine": [
+    {"action": "restore", "record_no": "R2"}
+  ]
+}
+
+### 批量裁决拒绝示例（均整批拒绝、状态不变）：
+###   同一对象相反意图（409 adjudication_intent_conflict）
+###   引用不存在的记录（404 adjudication_record_missing）
+###   最终锁定对不满足互证候选条件（409 lock_not_candidate）
+###   同一记录被多对锁定（409 record_already_locked）
+###   最终锁定对成员仍处于隔离状态（409 lock_record_quarantined）
+###   基准版本过期（409 adjudication_base_version_changed）
+###   演练已封存（409 drill_sealed）；未知演练（404 drill_not_found）
+###   两个意图列表全空（422）；锁定意图两记录号相同（422 lock_same_record）
+POST {{host}}/drills/{{drill}}/adjudications
+Content-Type: application/json
+
+{
+  "base_version": 0,
+  "locks": [
+    {"action": "lock",   "record_a": "R1", "record_b": "R2"},
+    {"action": "unlock", "record_a": "R2", "record_b": "R1"}
+  ]
+}
+
+### 版本快照：列出已留存版本号（创建即有 0；升级前旧版本不出现）
+GET {{host}}/drills/{{drill}}/snapshots### 取回指定版本快照（配对/未配对/总时差/锁定清单；未留存版本 404 snapshot_not_found）
+GET {{host}}/drills/{{drill}}/snapshots/0
+
+### 比较两个已留存版本：配对/未配对/锁定的新增移除 + 同一对时差变化单列
+### 相同版本（如 /snapshots/2/diff/2）合法且差异全空
+GET {{host}}/drills/{{drill}}/snapshots/0/diff/1
+
+### 封存演练（封存后写入与锁定操作均返回 409，查询仍可用；封存不产生新快照）
+POST {{host}}/drills/{{drill}}/seal
+
+### 封存后仍可回看任意已留存版本（sealed 字段从现态读取为 true）
+GET {{host}}/drills/{{drill}}/snapshots/1
