@@ -323,6 +323,69 @@ class StationSummaryResponse(StrictModel):
     stations: list[StationSummaryItem]
 
 
+# --------------------------------------------------------------------------
+# 配对唯一性核查（复核员核查当前互证结果中哪些配对并非唯一选择；只读）
+# --------------------------------------------------------------------------
+class PairAlternativeOut(StrictModel):
+    """不含被核查配对的一份完整替代方案及其相对当前结果的增删。
+
+    方案满足“保持全部锁定对、排除隔离日志、配对数全场最大、总时差最小”；
+    在多个替代方案中按配对列表记录号字典序取最小的一份。
+    """
+
+    pairs: list[PairOut] = Field(..., description="替代方案的全部配对（含锁定对，按记录对升序）")
+    unpaired: list[str] = Field(..., description="替代方案下的未配对记录（按记录号升序）")
+    total_time_diff_seconds: float = Field(
+        ..., description="替代方案总时差（秒），与当前结果同为该配对数下的最小值"
+    )
+    added_pairs: list[PairOut] = Field(
+        ..., description="相对当前结果新增的配对（按记录对升序，含时差）"
+    )
+    removed_pairs: list[PairOut] = Field(
+        ..., description="相对当前结果移除的配对（按记录对升序，含时差）"
+    )
+
+
+class PairReviewOut(StrictModel):
+    """当前结果中一对非锁定配对的唯一性核查结论。"""
+
+    record_a: str
+    record_b: str
+    time_diff_seconds: float
+    universal: bool = Field(
+        ...,
+        description=(
+            "true=该对出现在所有“最大配对数+最小总时差”的合法完整方案中，"
+            "不可替换；false=存在等优替代方案，alternative 给出一份不含该对、"
+            "记录号字典序最小的完整替代"
+        ),
+    )
+    alternative: PairAlternativeOut | None = Field(
+        None, description="不可替换时为 null；可替换时为完整替代方案及增删"
+    )
+
+
+class PairUniquenessResponse(StrictModel):
+    """配对唯一性核查（当前版本；只读；空场条目为空，封存后仍可查）。"""
+
+    drill_id: str
+    version: int
+    sealed: bool
+    allowed_time_diff_seconds: float
+    optimal_pair_count: int = Field(
+        ..., description="合法完整方案的配对数（全场最大，含锁定对）"
+    )
+    total_time_diff_seconds: float = Field(
+        ..., description="该配对数下的最小总时差（秒），与当前结果一致"
+    )
+    locked_pairs: list[PairOut] = Field(
+        ..., description="当前全部人工锁定对（强制入选、不可替换，按记录对升序）"
+    )
+    pairs: list[PairReviewOut] = Field(
+        ..., description="当前每个非锁定配对的核查结论（按记录对升序）"
+    )
+
+
 class LockRequest(StrictModel):
     """锁定/解除锁定请求体：一对记录号（顺序任意，服务端内部升序）。"""
 

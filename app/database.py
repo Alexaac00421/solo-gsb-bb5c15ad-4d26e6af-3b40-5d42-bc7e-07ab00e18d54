@@ -28,9 +28,11 @@ from .matching import (
     MatchResult,
     Pair,
     Record,
+    UniquenessReview,
     diagnose_gaps,
     match_records,
     pair_eligibility,
+    review_pair_uniqueness,
 )
 
 MICROS_PER_SECOND = 1_000_000
@@ -1896,6 +1898,78 @@ def get_gap_diagnostics(drill_id: str) -> dict:
                     "time_diff_seconds": g.time_diff_seconds,
                 }
                 for g in gaps
+            ],
+        }
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# 配对唯一性核查（复核员核查当前结果中哪些配对并非唯一选择）：只读
+# --------------------------------------------------------------------------
+def _pair_out(p: Pair) -> dict:
+    return {
+        "record_a": p.record_a,
+        "record_b": p.record_b,
+        "time_diff_seconds": p.time_diff_seconds,
+    }
+
+
+def get_pair_uniqueness(drill_id: str) -> dict:
+    """核查当前互证结果中每个非锁定配对是否为等优方案中的唯一选择。
+
+    以**同一版本**的日志、人工锁定与隔离状态为准：保持全部锁定对、
+    排除隔离日志，枚举“配对数全场最大、总时差在该配对数下最小”的全部
+    合法完整方案（不施加第三级字典序决胜），逐条判定当前非锁定配对是否
+    出现在所有这类方案中；可替换的给出一份不含该对、记录号字典序最小的
+    完整替代及相对当前结果的增删。核查**只读**：不改日志、结果、版本与
+    快照；封存后仍可查询；未知演练抛 ``drill_not_found``；空场返回空清单。
+    """
+    conn = connect()
+    try:
+        with _read_tx(conn):
+            drill = _get_drill_row(conn, drill_id)
+            quarantined = _load_quarantine_nos(conn, drill_id)
+            records = [
+                r
+                for r in _load_records(conn, drill_id)
+                if r.record_no not in quarantined
+            ]
+            lock_keys = _load_lock_keys(conn, drill_id)
+            review: UniquenessReview = review_pair_uniqueness(
+                records, drill["allowed_diff_secs"], locked_keys=lock_keys
+            )
+        return {
+            "drill_id": drill_id,
+            "version": drill["version"],
+            "sealed": bool(drill["sealed"]),
+            "allowed_time_diff_seconds": drill["allowed_diff_secs"],
+            "optimal_pair_count": review.optimal_pair_count,
+            "total_time_diff_seconds": review.total_time_diff_seconds,
+            "locked_pairs": [_pair_out(p) for p in review.locked_pairs],
+            "pairs": [
+                {
+                    **_pair_out(rv.pair),
+                    "universal": rv.universal,
+                    "alternative": None
+                    if rv.alternative is None
+                    else {
+                        "pairs": [
+                            _pair_out(p) for p in rv.alternative.pairs
+                        ],
+                        "unpaired": list(rv.alternative.unpaired),
+                        "total_time_diff_seconds": (
+                            rv.alternative.total_time_diff_seconds
+                        ),
+                        "added_pairs": [
+                            _pair_out(p) for p in rv.alternative.added_pairs
+                        ],
+                        "removed_pairs": [
+                            _pair_out(p) for p in rv.alternative.removed_pairs
+                        ],
+                    },
+                }
+                for rv in review.pairs
             ],
         }
     finally:

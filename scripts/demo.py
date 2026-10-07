@@ -177,6 +177,11 @@ def main(base_url: str) -> None:
         "GET", f"{base_url}/drills/{drill}/station-summary"
     ))
 
+    # --- 配对唯一性核查：当前非锁定配对是否必有/可替换（只读） ---
+    show("配对唯一性核查（只读；universal=true 表示该对不可替换）", *call(
+        "GET", f"{base_url}/drills/{drill}/pair-uniqueness"
+    ))
+
     # --- 版本快照：复核员按版本回看、比较两版差异（只读） ---
     # 列出已留存版本号（创建即有 0；每次真正推进版本同事务留存一版）
     show("已留存快照版本号", *call(
@@ -326,9 +331,19 @@ def main(base_url: str) -> None:
         "GET", f"{base_url}/drills/{drill}/station-summary"
     ))
 
+    # 封存后仍可做配对唯一性核查（只读；版本、sealed 与最终现态一致；
+    # locked_pairs 回显最终锁定对，不进入逐条核查）
+    show("封存后仍可查询配对唯一性核查", *call(
+        "GET", f"{base_url}/drills/{drill}/pair-uniqueness"
+    ))
+
     # 未知演练明确报错：404 drill_not_found
     show("未知演练的缺口诊断（应 404 drill_not_found）", *call(
         "GET", f"{base_url}/drills/NOPE/gap-diagnostics"
+    ))
+
+    show("未知演练的配对唯一性核查（应 404 drill_not_found）", *call(
+        "GET", f"{base_url}/drills/NOPE/pair-uniqueness"
     ))
 
 

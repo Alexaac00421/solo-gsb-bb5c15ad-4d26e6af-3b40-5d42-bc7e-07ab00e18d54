@@ -22,6 +22,7 @@ from .schemas import (
     LockListResponse,
     LockRequest,
     LogEntry,
+    PairUniquenessResponse,
     QuarantineActionResponse,
     QuarantineListResponse,
     QuarantineRequest,
@@ -224,6 +225,16 @@ def get_gap_diagnostics(drill_id: str) -> dict:
 )
 def get_station_summary(drill_id: str) -> dict:
     return database.get_station_summary(drill_id)
+
+
+@app.get(
+    "/drills/{drill_id}/pair-uniqueness",
+    response_model=PairUniquenessResponse,
+    tags=["result"],
+    summary="配对唯一性核查（只读；核查当前非锁定配对是否必有/可替换，封存后仍可查）",
+)
+def get_pair_uniqueness(drill_id: str) -> dict:
+    return database.get_pair_uniqueness(drill_id)
 
 
 # --------------------------------------------------------------------------

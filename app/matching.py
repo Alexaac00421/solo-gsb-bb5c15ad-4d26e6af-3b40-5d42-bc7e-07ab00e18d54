@@ -30,10 +30,22 @@
       （奖励之差的绝对值 <= 2**E - 1），因此最小费用依次满足
       “时差和最小”、“配对列表字典序最小”。OFFSET = 2**(E-1)
       保证所有边费用非负，初始 potential 为 0 即可用 Dijkstra。
+
+复核唯一性核查（:func:`review_pair_uniqueness`）：
+  在“保持全部锁定对、排除隔离记录”的同一组日志上，枚举满足
+  “配对数全场最大、总时差在该配对数下最小”的**全部**合法完整方案
+  （不施加第三级字典序决胜——字典序只是当前接口的选解规则，并非
+  合法性条件），逐条核查当前结果中的非锁定配对是否出现在所有这类
+  方案中。判定利用最小费用流最优解的经典结构：以流结束后的可行位势
+  取残量网络中的**零费用弧（紧弧）**，一条入选边可被等优方案替换，
+  当且仅当它的两端在紧弧残量子图中处于同一强连通分量；沿该分量中的
+  有向环增广即得到同配对数、同总时差的替代完整方案。不含指定对的
+  字典序最小替代方案则直接在删除该边后的图上重跑三级费用流得到。
 """
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import heapq
 from typing import Sequence
@@ -112,14 +124,14 @@ def pair_eligibility(
     return None
 
 
-def _match_free(
+def _build_candidate_edges(
     records: Sequence[Record], allowed_micros: int
-) -> tuple[list[Pair], set[str], int]:
-    """在无锁定记录的集合上求全场最优匹配。
+) -> list[tuple[int, int, int, tuple[str, str]]]:
+    """构造候选边列表 ``(左记录下标, 右记录下标, 时差微秒, 配对键)``。
 
-    返回 ``(配对列表, 已配对记录号集合, 总时差微秒)``。
+    用右部索引加速相互指认查找；调用方负责传入已剔除锁定/隔离成员的
+    记录序列。
     """
-    # --- 构造候选边：用索引加速相互指认的查找 ---
     # 右部索引：(本台, 对方, band, mode) -> [记录...]，
     # 左部记录 r 以 (counterpart, station, band, mode) 反查即可找到
     # 所有“本台==r.对方、对方==r.本台”的候选记录。
@@ -143,11 +155,37 @@ def _match_free(
             if diff_micros <= allowed_micros:
                 edges.append((i, j, diff_micros, _pair_key(r, records[j])))
 
-    if not edges:
-        return [], set(), 0
-
     # 边按配对键升序定等级：等级越小（记录号组合越小）字典序优先级越高。
     edges.sort(key=lambda e: e[3])
+    return edges
+
+
+@dataclass(frozen=True)
+class _FlowNetwork:
+    """自由匹配子图上的费用流网络与其解。
+
+    ``graph`` 为前向星残余网络，每条残余边为
+    ``[to, cap, cost, rev]``（就地修改容量）；其余字段为节点映射与
+    候选边信息，供唯一性核查复用同一张图。
+    """
+
+    graph: list[list[list[int]]]
+    edges: tuple[tuple[int, int, int, tuple[str, str]], ...]
+    records: tuple[Record, ...]
+    source: int
+    sink: int
+    lidx: dict[int, int]           # 左记录下标 -> 网络节点
+    ridx: dict[int, int]           # 右记录下标 -> 网络节点
+    match_arc: tuple[tuple[int, int], ...]  # 与 edges 对齐：(左节点, L->R 边下标)
+    flow: int
+    total_micros: int
+
+
+def _solve_flow_network(
+    records: Sequence[Record],
+    edges: Sequence[tuple[int, int, int, tuple[str, str]]],
+) -> _FlowNetwork:
+    """在给定候选边上建最小费用最大流网络并求流（三级目标一次完成）。"""
     e_count = len(edges)
     scale = 1 << e_count          # 2**E，时差主项的放大倍数
     # 入选 rank 边的字典序奖励为 2**(E-1-rank)：rank 0 为最高位，
@@ -156,7 +194,7 @@ def _match_free(
     # 费用 = 时差*SCALE + 偏移 - 奖励；最小化费用即最大化奖励。
     # 最大奖励为 2**(E-1)，减去奖励后该项恒 >= 0，故费用恒非负，
     # 初始 potential 全为 0 即可直接使用 Dijkstra。
-    offset = 1 << (e_count - 1)
+    offset = 1 << (e_count - 1) if e_count else 0
 
     left_nodes = sorted({i for (i, _j, _w, _k) in edges})
     right_nodes = sorted({j for (_i, j, _w, _k) in edges})
@@ -194,6 +232,7 @@ def _match_free(
 
     # --- 最小费用最大流（Dijkstra + potential） ---
     potential = [0] * n_nodes
+    flow = 0
     while True:
         inf = None  # Python 大整数无溢出风险，用 None 表示不可达
         dist = [inf] * n_nodes
@@ -230,16 +269,35 @@ def _match_free(
             rev = graph[v][arc[3]]
             rev[1] += 1
             v = u
+        flow += 1
 
-    # --- 提取配对 ---
-    pairs: list[Pair] = []
-    matched: set[str] = set()
     total_micros = 0
-    for rank, (i, j, weight, key) in enumerate(edges):
-        # L->R 的前向边容量被用尽 => 该边入选匹配。
+    for rank, (_i, _j, weight, _key) in enumerate(edges):
         u, fwd = match_arc[rank]
         if graph[u][fwd][1] == 0:
             total_micros += weight
+
+    return _FlowNetwork(
+        graph=graph,
+        edges=tuple(edges),
+        records=tuple(records),
+        source=source,
+        sink=sink,
+        lidx=lidx,
+        ridx=ridx,
+        match_arc=tuple(match_arc),
+        flow=flow,
+        total_micros=total_micros,
+    )
+
+
+def _extract_flow_pairs(network: _FlowNetwork) -> list[Pair]:
+    """从求流后的网络提取入选配对（按配对键升序）。"""
+    pairs: list[Pair] = []
+    for rank, (_i, _j, weight, key) in enumerate(network.edges):
+        # L->R 的前向边容量被用尽 => 该边入选匹配。
+        u, fwd = network.match_arc[rank]
+        if network.graph[u][fwd][1] == 0:
             pairs.append(
                 Pair(
                     record_a=key[0],
@@ -247,9 +305,34 @@ def _match_free(
                     time_diff_seconds=weight / MICROS_PER_SECOND,
                 )
             )
+    return pairs
+
+
+def _match_free(
+    records: Sequence[Record],
+    allowed_micros: int,
+    excluded_keys: frozenset[tuple[str, str]] = frozenset(),
+) -> tuple[list[Pair], set[str], int]:
+    """在无锁定记录的集合上求全场最优匹配。
+
+    返回 ``(配对列表, 已配对记录号集合, 总时差微秒)``。``excluded_keys``
+    中的候选边（配对键）不参与求解，供唯一性核查在删边图上重算替代方案。
+    """
+    edges = [
+        e for e in _build_candidate_edges(records, allowed_micros)
+        if e[3] not in excluded_keys
+    ]
+    if not edges:
+        return [], set(), 0
+    network = _solve_flow_network(records, edges)
+    pairs = _extract_flow_pairs(network)
+    matched: set[str] = set()
+    for rank, (i, j, _w, _key) in enumerate(network.edges):
+        u, fwd = network.match_arc[rank]
+        if network.graph[u][fwd][1] == 0:
             matched.add(records[i].record_no)
             matched.add(records[j].record_no)
-    return pairs, matched, total_micros
+    return pairs, matched, network.total_micros
 
 
 def match_records(
@@ -264,32 +347,11 @@ def match_records(
     匹配；即使锁定使全场配对数下降，锁定对也保留不替换。
     """
     allowed_micros = int(round(allowed_diff_seconds * MICROS_PER_SECOND))
-    record_map = {r.record_no: r for r in records}
 
     # --- 先固定全部锁定对，并把其记录移出自由匹配池 ---
-    pairs: list[Pair] = []
-    locked_ids: set[str] = set()
-    total_micros = 0
-    for raw_a, raw_b in locked_keys:
-        a, b = (raw_a, raw_b) if raw_a <= raw_b else (raw_b, raw_a)
-        problem = pair_eligibility(record_map, allowed_micros, a, b)
-        if problem is not None:
-            raise InvalidLockError(f"锁定 ({a}, {b}) 已失效: {problem[1]}")
-        if a in locked_ids or b in locked_ids:
-            raise InvalidLockError(f"记录被多个锁定对重复占用: {a}, {b}")
-        locked_ids.add(a)
-        locked_ids.add(b)
-        weight = abs(record_map[a].ts_micros - record_map[b].ts_micros)
-        total_micros += weight
-        pairs.append(
-            Pair(
-                record_a=a,
-                record_b=b,
-                time_diff_seconds=weight / MICROS_PER_SECOND,
-            )
-        )
-
-    free_records = [r for r in records if r.record_no not in locked_ids]
+    pairs, locked_ids, total_micros, free_records = _split_locked_records(
+        records, allowed_micros, locked_keys
+    )
     free_pairs, free_matched, free_total = _match_free(
         free_records, allowed_micros
     )
@@ -305,6 +367,301 @@ def match_records(
         pairs=tuple(pairs),
         unpaired=unpaired,
         total_time_diff_seconds=total_micros / MICROS_PER_SECOND,
+    )
+
+
+# --------------------------------------------------------------------------
+# 配对唯一性核查（复核员核查当前结果中哪些配对并非唯一选择）
+#
+# 合法完整方案的口径：保持全部锁定对、排除隔离记录后，在同一组日志上
+# “配对数全场最大、总时差在该配对数下最小”的全部匹配（第三级字典序
+# 只是原结果接口的选解规则，不是方案合法性条件，故不作为筛选条件）。
+#
+# 结构判定（最小费用流最优解的经典性质）：求流结束后残量网络中存在
+# 可行位势 h 使所有残量弧的约化费用非负；约化费用为 0 的残量弧称
+# “紧弧”。沿紧弧构成的有向环增广环流，流量（配对数）与费用（总时差）
+# 均不变，即得到另一个等优合法完整方案。一条入选边 e=(u,v) 能被等优
+# 方案替换，当且仅当：
+#   1. 其费用弧本身紧（h[u] + cost == h[v]，反向退流弧才也是紧弧）；
+#   2. 紧弧残量子图中 u 可沿残量弧到达 v（与反向弧 v->u 合成零费用环）。
+# 等价地，u、v 在紧弧残量子图中处于同一强连通分量且费用弧紧。
+# 判定为可替换后，直接在删除该边的图上重跑三级费用流：删边不改变最大
+# 配对数时所得即为“不含该对的字典序最小合法完整方案”；若删边会降低
+# 配对数或增大总时差（防御性兜底，理论上不应发生），仍按不可替换处理。
+# --------------------------------------------------------------------------
+@dataclass(frozen=True)
+class PairAlternative:
+    """不含被核查配对的一份完整替代方案及其相对当前结果的增删。"""
+
+    pairs: tuple[Pair, ...]
+    unpaired: tuple[str, ...]
+    total_time_diff_seconds: float
+    added_pairs: tuple[Pair, ...]
+    removed_pairs: tuple[Pair, ...]
+
+
+@dataclass(frozen=True)
+class PairReview:
+    """当前结果中一对非锁定配对的唯一性核查结论。
+
+    ``universal`` 为真表示该对出现在所有“最大配对数 + 最小总时差”的
+    合法完整方案中；否则 ``alternative`` 给出一份不含该对、字典序最小
+    的完整替代方案（含相对当前结果的增删）。
+    """
+
+    pair: Pair
+    universal: bool
+    alternative: PairAlternative | None
+
+
+@dataclass(frozen=True)
+class UniquenessReview:
+    """整场唯一性核查结论（当前版本的非锁定配对逐条给出）。"""
+
+    pairs: tuple[PairReview, ...]
+    locked_pairs: tuple[Pair, ...]
+    optimal_pair_count: int
+    total_time_diff_seconds: float
+
+
+def _feasible_potential(
+    graph: Sequence[Sequence[Sequence[int]]],
+    arc_cost: Sequence[Sequence[int]],
+) -> list[int]:
+    """在残量网络上求一组可行位势（全部残量弧约化费用 >= 0）。
+
+    最优流不存在负费用残量环；以全 0 初值（等价于增设超级源连所有点）
+    跑 Bellman-Ford/SPFA 即可收敛，且紧弧（约化费用为 0 的残量弧）不
+    依赖增广过程中的历史位势，判定等优方案时不会出现伪零弧。
+    ``arc_cost`` 与 ``graph`` 平行给出每条残余弧的**实际费用**：唯一性
+    核查须用真实时差费用（不含字典序奖励），否则等价时差方案会被奖励
+    项误判为费用更高。
+    """
+    n_nodes = len(graph)
+    dist = [0] * n_nodes
+    in_queue = [True] * n_nodes
+    queue: deque[int] = deque(range(n_nodes))
+    while queue:
+        u = queue.popleft()
+        in_queue[u] = False
+        du = dist[u]
+        for ei, arc in enumerate(graph[u]):
+            v, cap, _cost, _rev = arc
+            cost = arc_cost[u][ei]
+            if cap > 0 and dist[v] > du + cost:
+                dist[v] = du + cost
+                if not in_queue[v]:
+                    in_queue[v] = True
+                    queue.append(v)
+    return dist
+
+
+def _true_residual_costs(network: _FlowNetwork) -> list[list[int]]:
+    """构造与残余网络平行的“真实时差费用”表。
+
+    建网费用含字典序奖励（``时差*SCALE + OFFSET - 奖励``），只能选出
+    第三级字典序唯一解；核查“同配对数、同总时差”的等优方案时须改用
+    配对的真实时差（微秒）：L->R 正向弧费用为时差，其反向弧为负时差，
+    源/汇相关弧费用为 0。当前流在真实费用下仍是最小费用最大流
+    （前两级目标一致），故其残量网络存在可行位势。
+    """
+    costs: list[list[int]] = [
+        [0] * len(arcs) for arcs in network.graph
+    ]
+    for rank, (_i, _j, weight, _key) in enumerate(network.edges):
+        u, fwd = network.match_arc[rank]
+        v, _cap, _cost, rev = network.graph[u][fwd]
+        costs[u][fwd] = weight
+        costs[v][rev] = -weight
+    return costs
+
+
+def _strongly_connected_components(
+    adjacency: Sequence[Sequence[int]],
+) -> list[int]:
+    """迭代版 Kosaraju：返回每个节点的强连通分量编号（两遍 DFS）。"""
+    n_nodes = len(adjacency)
+    reverse: list[list[int]] = [[] for _ in range(n_nodes)]
+    for u, neighbors in enumerate(adjacency):
+        for v in neighbors:
+            reverse[v].append(u)
+
+    visited = [False] * n_nodes
+    order: list[int] = []
+    for start in range(n_nodes):
+        if visited[start]:
+            continue
+        visited[start] = True
+        stack: list[tuple[int, int]] = [(start, 0)]
+        while stack:
+            u, i = stack[-1]
+            if i < len(adjacency[u]):
+                v = adjacency[u][i]
+                stack[-1] = (u, i + 1)
+                if not visited[v]:
+                    visited[v] = True
+                    stack.append((v, 0))
+            else:
+                order.append(u)
+                stack.pop()
+
+    component = [-1] * n_nodes
+    cid = 0
+    for start in reversed(order):
+        if component[start] != -1:
+            continue
+        component[start] = cid
+        stack = [start]
+        while stack:
+            u = stack.pop()
+            for v in reverse[u]:
+                if component[v] == -1:
+                    component[v] = cid
+                    stack.append(v)
+        cid += 1
+    return component
+
+
+def _split_locked_records(
+    records: Sequence[Record],
+    allowed_micros: int,
+    locked_keys: Sequence[tuple[str, str]],
+) -> tuple[list[Pair], set[str], int, list[Record]]:
+    """校验并固定锁定对，返回 (锁定配对, 锁定记录号, 锁定总时差, 自由记录)。"""
+    record_map = {r.record_no: r for r in records}
+    locked: list[Pair] = []
+    locked_ids: set[str] = set()
+    locked_total = 0
+    for raw_a, raw_b in locked_keys:
+        a, b = (raw_a, raw_b) if raw_a <= raw_b else (raw_b, raw_a)
+        problem = pair_eligibility(record_map, allowed_micros, a, b)
+        if problem is not None:
+            raise InvalidLockError(f"锁定 ({a}, {b}) 已失效: {problem[1]}")
+        if a in locked_ids or b in locked_ids:
+            raise InvalidLockError(f"记录被多个锁定对重复占用: {a}, {b}")
+        locked_ids.add(a)
+        locked_ids.add(b)
+        weight = abs(record_map[a].ts_micros - record_map[b].ts_micros)
+        locked_total += weight
+        locked.append(
+            Pair(
+                record_a=a,
+                record_b=b,
+                time_diff_seconds=weight / MICROS_PER_SECOND,
+            )
+        )
+    free_records = [r for r in records if r.record_no not in locked_ids]
+    return locked, locked_ids, locked_total, free_records
+
+
+def review_pair_uniqueness(
+    records: Sequence[Record],
+    allowed_diff_seconds: float,
+    locked_keys: Sequence[tuple[str, str]] = (),
+) -> UniquenessReview:
+    """核查当前最优结果中每个非锁定配对是否为等优方案中的唯一选择。
+
+    ``records`` 应为当前版本下**未隔离**的全部日志（隔离由服务层剔除）；
+    ``locked_keys`` 为当前人工锁定（服务层已保证合法）。返回的条目按
+    配对键（记录号字典序）升序，锁定对不在条目中，仅以 ``locked_pairs``
+    原样回显（锁定对强制入选，不可替换）。
+    """
+    allowed_micros = int(round(allowed_diff_seconds * MICROS_PER_SECOND))
+    locked, _locked_ids, locked_total, free_records = _split_locked_records(
+        records, allowed_micros, locked_keys
+    )
+
+    candidate_edges = _build_candidate_edges(free_records, allowed_micros)
+    reviews: list[PairReview] = []
+    free_total = 0
+    free_flow = 0
+    if candidate_edges:
+        network = _solve_flow_network(free_records, candidate_edges)
+        free_total = network.total_micros
+        free_flow = network.flow
+
+        # 紧弧残量子图与其强连通分量（紧弧按真实时差费用判定）。
+        true_cost = _true_residual_costs(network)
+        potential = _feasible_potential(network.graph, true_cost)
+        n_nodes = len(network.graph)
+        tight_adj: list[list[int]] = [[] for _ in range(n_nodes)]
+        for u, arcs in enumerate(network.graph):
+            for ei, arc in enumerate(arcs):
+                v, cap, _cost, _rev = arc
+                if cap > 0 and potential[u] + true_cost[u][ei] == potential[v]:
+                    tight_adj[u].append(v)
+        component = _strongly_connected_components(tight_adj)
+
+        current_free_pairs = _extract_flow_pairs(network)
+        current_full = sorted(locked + current_free_pairs, key=lambda p: p.as_tuple())
+        current_map = {p.as_tuple(): p for p in current_full}
+
+        for rank, (i, j, weight, key) in enumerate(network.edges):
+            u, fwd = network.match_arc[rank]
+            if network.graph[u][fwd][1] != 0:
+                continue  # 仅核查入选当前结果的配对。
+            v = network.graph[u][fwd][0]
+            arc_tight = potential[u] + true_cost[u][fwd] == potential[v]
+            replaceable = arc_tight and component[u] == component[v]
+
+            pair = Pair(
+                record_a=key[0],
+                record_b=key[1],
+                time_diff_seconds=weight / MICROS_PER_SECOND,
+            )
+            if not replaceable:
+                reviews.append(PairReview(pair, True, None))
+                continue
+
+            # 删除该边后重跑三级费用流：所得即不含该对的字典序最小
+            # 合法完整方案；删边导致配对数下降/总时差增大时按不可替换。
+            alt_pairs, alt_matched, alt_total = _match_free(
+                free_records,
+                allowed_micros,
+                excluded_keys=frozenset({key}),
+            )
+            alt_full = sorted(locked + alt_pairs, key=lambda p: p.as_tuple())
+            if (
+                len(alt_pairs) != network.flow
+                or alt_total != network.total_micros
+                or key in {p.as_tuple() for p in alt_pairs}
+            ):
+                reviews.append(PairReview(pair, True, None))
+                continue
+
+            alt_map = {p.as_tuple(): p for p in alt_full}
+            removed = [
+                current_map[k] for k in sorted(set(current_map) - set(alt_map))
+            ]
+            added = [alt_map[k] for k in sorted(set(alt_map) - set(current_map))]
+            unpaired = tuple(
+                sorted(
+                    r.record_no
+                    for r in free_records
+                    if r.record_no not in alt_matched
+                )
+            )
+            reviews.append(
+                PairReview(
+                    pair=pair,
+                    universal=False,
+                    alternative=PairAlternative(
+                        pairs=tuple(alt_full),
+                        unpaired=unpaired,
+                        total_time_diff_seconds=(
+                            locked_total + alt_total
+                        ) / MICROS_PER_SECOND,
+                        added_pairs=tuple(added),
+                        removed_pairs=tuple(removed),
+                    ),
+                )
+            )
+
+    return UniquenessReview(
+        pairs=tuple(reviews),
+        locked_pairs=tuple(sorted(locked, key=lambda p: p.as_tuple())),
+        optimal_pair_count=len(locked) + free_flow,
+        total_time_diff_seconds=(locked_total + free_total) / MICROS_PER_SECOND,
     )
 
 
